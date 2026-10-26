@@ -1,20 +1,149 @@
-import requests
-from bs4 import BeautifulSoup
 import json
 import re
 import sys
+from urllib.parse import unquote, urlsplit
+
+import requests
+from bs4 import BeautifulSoup
 
 BASE_URL = "https://ollama.com"
-LIBRARY_URL = "https://ollama.com/library?sort=popular"
+LIBRARY_URL = f"{BASE_URL}/library?sort=popular"
+REQUEST_TIMEOUT = 30
+HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; ollama-library-scraper/1.0)"}
+
+SIZE_RE = re.compile(
+    r"(?<![\w.])(\d+(?:\.\d+)?\s*(?:TB|GB|MB|KB|B))(?!\w)",
+    re.IGNORECASE,
+)
+
+LANGUAGE_CODES = {
+    "english": "en",
+    "german": "de",
+    "french": "fr",
+    "italian": "it",
+    "portuguese": "pt",
+    "hindi": "hi",
+    "spanish": "es",
+    "thai": "th",
+    "japanese": "ja",
+    "chinese": "zh",
+    "korean": "ko",
+    "russian": "ru",
+    "dutch": "nl",
+    "polish": "pl",
+    "turkish": "tr",
+    "indonesian": "id",
+    "vietnamese": "vi",
+    "arabic": "ar",
+    "hebrew": "he",
+    "swedish": "sv",
+    "danish": "da",
+    "norwegian": "no",
+    "finnish": "fi",
+    "czech": "cs",
+    "ukrainian": "uk",
+}
+
+# Ollama currently renders capabilities with indigo/cyan badges.  The text
+# fallback keeps this working if those Tailwind classes change again.
+KNOWN_CAPABILITIES = {
+    "audio",
+    "cloud",
+    "code",
+    "decision",
+    "embedding",
+    "reranking",
+    "thinking",
+    "tools",
+    "vision",
+}
+
 
 def get_soup(url):
+    """Fetch *url* and return a parsed document, or ``None`` on failure."""
     try:
-        response = requests.get(url, headers={"User-Agent": "Mozilla/5.0"})
-        if response.status_code == 200:
-            return BeautifulSoup(response.text, "html.parser")
-    except Exception as e:
-        sys.stderr.write(f"Error fetching {url}: {e}\n")
-    return None
+        response = requests.get(url, headers=HEADERS, timeout=REQUEST_TIMEOUT)
+        if response.status_code != 200:
+            sys.stderr.write(f"Error fetching {url}: HTTP {response.status_code}\n")
+            return None
+        return BeautifulSoup(response.text, "html.parser")
+    except (requests.RequestException, OSError, ValueError) as exc:
+        # A single unavailable model should not abort a complete scrape.
+        sys.stderr.write(f"Error fetching {url}: {exc}\n")
+        return None
+
+
+def _path(value):
+    """Return a normalized URL path for relative or absolute links."""
+    return unquote(urlsplit(value).path).rstrip("/")
+
+
+def _model_name_from_href(href):
+    """Extract a model slug from a direct ``/library/<model>`` link."""
+    path = _path(href)
+    prefix = "/library/"
+    if not path.startswith(prefix):
+        return None
+
+    model_name = path[len(prefix) :]
+    # Tag links (/library/name:tag), nested pages, and /library itself are not
+    # model cards on the library listing.
+    if not model_name or "/" in model_name or ":" in model_name:
+        return None
+    return model_name
+
+
+def _unique(values):
+    return list(dict.fromkeys(value for value in values if value))
+
+
+def _extract_description(link, model_name):
+    """Extract the card description across old and current page layouts."""
+    # Older pages marked the card's title container explicitly.  Keep this
+    # selector as a compatibility path, but do not require it.
+    marker = link.find(attrs={"x-test-model-title": True})
+    if marker:
+        paragraph = marker if marker.name == "p" else marker.find("p")
+        if paragraph:
+            text = paragraph.get_text(" ", strip=True)
+            if text and text.casefold() != model_name.casefold():
+                return text
+
+    # Current cards have the description as their first paragraph.
+    for paragraph in link.find_all("p"):
+        text = paragraph.get_text(" ", strip=True)
+        if text and text.casefold() != model_name.casefold():
+            return text
+    return ""
+
+
+def _extract_categories(link):
+    categories = []
+
+    # This is the stable selector used by the older markup.
+    marked = link.find_all(attrs={"x-test-capability": True})
+    for span in marked:
+        text = span.get_text(" ", strip=True)
+        if text:
+            categories.append(text)
+
+    # Current markup uses colored badges without the x-test attributes.
+    if not marked:
+        for span in link.find_all("span"):
+            text = span.get_text(" ", strip=True)
+            if not text:
+                continue
+            capability = text.casefold()
+            classes = set(span.get("class", []))
+            if (
+                "bg-indigo-50" in classes
+                or "bg-cyan-50" in classes
+                or capability in KNOWN_CAPABILITIES
+            ):
+                categories.append(text)
+
+    return _unique(categories)
+
 
 def scrape_ollama_library():
     print(f"Scraping {LIBRARY_URL}...", file=sys.stderr)
@@ -23,56 +152,86 @@ def scrape_ollama_library():
         return {}
 
     models = {}
-    
-    # The list items seem to be <a> tags with class "group" inside the main list
-    # Based on grep: <a href="/library/llama3.3" class="group w-full space-y-5">
-    
-    # Finding the list container might be safer
-    # Assuming the list is the main content.
-    
-    model_links = soup.find_all("a", href=True)
-    
-    for link in model_links:
-        href = link.get("href")
-        if not href.startswith("/library/"):
+    for link in soup.find_all("a", href=True):
+        href = link.get("href", "")
+        model_name = _model_name_from_href(href)
+        if not model_name:
             continue
-            
-        # Check if it's a model card (has specific structure)
-        title_div = link.find("div", attrs={"x-test-model-title": True})
-        if not title_div:
-            continue
-            
-        model_name = href.replace("/library/", "")
-        model_url = BASE_URL + href
-        
-        # Extract basic info from list card
-        description_p = title_div.find("p")
-        description = description_p.get_text(strip=True) if description_p else ""
-        
-        # Categories/Capabilities from list
-        # Look for spans with x-test-capability
-        categories = []
-        cap_spans = link.find_all("span", attrs={"x-test-capability": True})
-        for span in cap_spans:
-            categories.append(span.get_text(strip=True))
-            
-        # Initialize model entry
-        models[model_name] = {
-            "url": model_url,
-            "tags": [], # To be filled from tags page
-            "author": "", # To be filled from detail page
-            "categories": categories,
-            "languages": [], # To be filled from detail page
-            "description": description
-        }
+
+        # A model card can be repeated in responsive markup.  Keep the first
+        # occurrence and avoid making duplicate detail requests.
+        models.setdefault(
+            model_name,
+            {
+                "url": BASE_URL + "/library/" + model_name,
+                "tags": [],
+                "author": "",
+                "categories": _extract_categories(link),
+                "languages": [],
+                "description": _extract_description(link, model_name),
+            },
+        )
 
     print(f"Found {len(models)} models. Fetching details...", file=sys.stderr)
-    
-    # Limit for testing? User didn't say. I'll process all found on first page.
     for model_name, data in models.items():
         scrape_model_details(model_name, data)
-        
     return models
+
+
+def _find_author(model_name, text_content):
+    known_authors = [
+        "Meta",
+        "Microsoft",
+        "Google",
+        "Mistral",
+        "Qwen",
+        "Alibaba",
+        "DeepSeek",
+        "Nvidia",
+        "OpenAI",
+        "Cohere",
+        "IBM",
+        "Databricks",
+        "Stability AI",
+        "Tencent",
+        "MiniMax",
+        "Moonshot AI",
+    ]
+    for author in known_authors:
+        pattern = rf"\b(?:from|by|created by|developed by)\s+{re.escape(author)}\b"
+        if re.search(pattern, text_content, re.IGNORECASE):
+            return author
+
+    # The Qwen pages historically did not mention the team in a consistent
+    # sentence, but the model name is an unambiguous fallback.
+    if model_name.casefold().startswith(("qw", "qwen")):
+        return "Qwen Team"
+    return "Ollama"
+
+
+def _extract_languages(soup):
+    readme = soup.find("div", class_="prose")
+    if not readme:
+        return []
+
+    readme_text = readme.get_text(" ", strip=True)
+    # README files use both “Supported languages:” and “Languages:”.  Stop at
+    # the next sentence so prose after the list is not treated as a language.
+    match = re.search(
+        r"(?:supported\s+languages?|languages?)\s*:?\s*([^.;\n]+)",
+        readme_text,
+        re.IGNORECASE,
+    )
+    if not match:
+        return []
+
+    names = re.split(
+        r"\s*(?:,|;|/|\band\b|\bor\b)\s*",
+        match.group(1),
+        flags=re.IGNORECASE,
+    )
+    return convert_languages(names)
+
 
 def scrape_model_details(model_name, data):
     url = data["url"]
@@ -81,166 +240,85 @@ def scrape_model_details(model_name, data):
     if not soup:
         return
 
-    # 1. Author
-    # Try to find "from [Author]" in description or look for specific text patterns
-    # In list page: "Llama 3.1 is a new state-of-the-art model from Meta..."
-    # In detail page text: "New state-of-the-art 70B model from Meta..."
-    
-    # Default author
-    author = "Ollama" 
-    
-    # Try to extract from text
-    # Gather all text from paragraphs
-    text_content = soup.get_text(" ", strip=True)
-    
-    # Simple heuristic for common authors
-    known_authors = ["Meta", "Microsoft", "Google", "Mistral", "Qwen", "Alibaba", "DeepSeek", "Nvidia"]
-    for auth in known_authors:
-        if f"from {auth}" in text_content or f"by {auth}" in text_content:
-            author = auth
-            break
-            
-    # Specific fix for Qwen/QwQ if not found
-    if model_name.startswith("qw") or model_name.startswith("qwen"):
-        if author == "Ollama":
-            author = "Qwen Team" # As per user example
-            
-    if author == "Ollama" and "Llama" in model_name:
-         if "Meta" in text_content:
-             author = "Meta"
+    description_meta = soup.find("meta", attrs={"name": "description"})
+    if description_meta and description_meta.get("content"):
+        data["description"] = description_meta["content"].strip()
 
-    data["author"] = author
+    data["author"] = _find_author(model_name, soup.get_text(" ", strip=True))
+    languages = _extract_languages(soup)
+    data["languages"] = languages or ["en"]
 
-    # 2. Languages
-    # Look for "Supported languages: ..."
-    # Based on grep: <p><strong>Supported languages</strong>: English, ...</p>
-    languages = []
-    
-    # Regex to find "Supported languages"
-    # It might be in a p tag, potentially with strong tag
-    # We search in the text of the description/readme area
-    
-    readme_div = soup.find("div", class_="prose") # Assuming prose class for markdown content
-    if readme_div:
-        readme_text = readme_div.get_text(" ", strip=True)
-        # Regex for "Supported languages: lang1, lang2..."
-        lang_match = re.search(r"Supported languages[:\s]+(.*?)(?:\.|$)", readme_text, re.IGNORECASE)
-        if lang_match:
-            langs_str = lang_match.group(1)
-            # Split by comma or "and"
-            # Remove "and"
-            langs_str = re.sub(r"\band\b", ",", langs_str)
-            langs = [l.strip() for l in langs_str.split(",") if l.strip()]
-            
-            # Convert full names to codes if possible? 
-            # User example: ["en", "de", "fr"...]
-            # Need a mapping or just use what is found. User example shows codes.
-            # The site shows full names "English, German...".
-            # I need a mapping.
-            languages = convert_languages(langs)
-    
-    if not languages and "multilingual" in data["categories"]:
-        # Fallback if no specific list found but categorized as multilingual
-        pass 
-        
-    # If generic English
-    if not languages:
-        languages = ["en"]
-        
-    data["languages"] = languages
+    scrape_model_tags(f"{url}/tags", data)
 
-    # 3. Tags and Sizes
-    # Scrape tags page
-    tags_url = f"{url}/tags"
-    scrape_model_tags(tags_url, data)
 
 def convert_languages(lang_names):
-    # Basic mapping
-    mapping = {
-        "english": "en", "german": "de", "french": "fr", "italian": "it", 
-        "portuguese": "pt", "hindi": "hi", "spanish": "es", "thai": "th",
-        "japanese": "ja", "chinese": "zh", "korean": "ko", "russian": "ru",
-        "dutch": "nl", "polish": "pl", "turkish": "tr", "indonesian": "id",
-        "vietnamese": "vi", "arabic": "ar"
-    }
+    """Convert language names/codes to the stable two-letter output format."""
     codes = []
     for name in lang_names:
-        code = mapping.get(name.lower())
-        if code:
+        normalized = re.sub(r"\s+", " ", str(name).strip().lower())
+        normalized = normalized.strip(" .:-()[]{}")
+        code = LANGUAGE_CODES.get(normalized)
+        if not code and re.fullmatch(r"[a-z]{2}", normalized):
+            code = normalized
+        if code and code not in codes:
             codes.append(code)
     return codes
+
+
+def _size_from_row(row, model_tag=""):
+    if not row:
+        return ""
+
+    # In the desktop layout the size is the first ``col-span-2`` paragraph.
+    # Reading it directly avoids mistaking a tag such as ``8b`` for a size.
+    size_cell = row.find(
+        "p", class_=lambda classes: classes and "col-span-2" in classes
+    )
+    text = size_cell.get_text(" ", strip=True) if size_cell else row.get_text(" ", strip=True)
+    if model_tag:
+        text = text.replace(model_tag, "")
+    match = SIZE_RE.search(text)
+    return match.group(1).replace(" ", "") if match else ""
+
+
+def _tag_row(link):
+    # Desktop rows have a grid; mobile rows contain the same data in a parent
+    # with class ``group px-4 py-3``.  Walking upward handles both layouts.
+    row = link.find_parent(
+        lambda tag: tag.name == "div" and "grid" in tag.get("class", [])
+    )
+    if row:
+        return row
+    return link.find_parent(lambda tag: tag.name in {"div", "a"})
+
 
 def scrape_model_tags(url, data):
     soup = get_soup(url)
     if not soup:
         return
 
-    tags_list = []
-    
-    # Find list items for tags
-    # Structure saw earlier:
-    # <div class="flex items-center justify-between w-full">
-    #   <div><span class="group-hover:underline">tagname</span></div>
-    # </div>
-    # ...
-    # <p class="col-span-2 text-neutral-500 text-[13px]">43GB</p>
-    
-    # This structure is a bit loose in grep. Let's look for the rows.
-    # The tags seem to be in a list.
-    
-    # Let's look for "a" tags with href including the model name
-    # href="/library/llama3.3:70b"
-    
-    # Or iterate over rows if they are structured as rows.
-    
-    # Strategy: Find all links that look like tags, then find the size sibling.
-    
-    # It seems to be a grid or list.
-    # <div class="flex flex-col space-y-[6px]"> ... list of rows ... </div>
-    
-    links = soup.find_all("a", href=True)
-    for link in links:
-        href = link.get("href")
-        if not href or ":" not in href:
+    model_path = _path(data["url"])
+    tags = {}
+    for link in soup.find_all("a", href=True):
+        path = _path(link.get("href", ""))
+        prefix = model_path + ":"
+        if not path.startswith(prefix):
             continue
-            
-        if data["url"].replace(BASE_URL, "") not in href:
-            continue
-            
-        # This link is a tag link, e.g. /library/llama3.3:70b
-        tag_name = href.split(":")[-1]
-        
-        # Now find the size. 
-        # The size is usually in the same row container.
-        # <div class="grid grid-cols-12 items-center"> ... </div>
-        
-        row = link.find_parent("div", class_="grid")
-        if not row:
-            # Maybe it's the mobile view or different structure
-            # Try finding parent of parent
-            # The grep showed: 
-            # <span class="flex items-center font-medium col-span-6 group text-sm"> <a ...> </a> </span>
-            # <p class="col-span-2 text-neutral-500 text-[13px]">43GB</p>
-            
-            # The link is inside a span col-span-6.
-            # The size is in a p col-span-2.
-            
-            row = link.find_parent("div", class_="grid")
-            
-        if row:
-            # Find the size paragraph
-            # It usually has text with "GB" or "MB"
-            size_p = row.find("p", string=re.compile(r"GB|MB|KB"))
-            if size_p:
-                size = size_p.get_text(strip=True)
-                # Add to tags if not exists
-                if [tag_name, size] not in tags_list:
-                    tags_list.append([tag_name, size])
 
-    data["tags"] = tags_list
+        tag_name = path[len(prefix) :]
+        if not tag_name or "/" in tag_name:
+            continue
+
+        size = _size_from_row(_tag_row(link), link.get_text(" ", strip=True))
+        # The responsive page contains each tag twice.  Prefer the first
+        # occurrence with a size and retain document order.
+        if tag_name not in tags or (not tags[tag_name] and size):
+            tags[tag_name] = size
+
+    data["tags"] = [[tag, size] for tag, size in tags.items() if size]
+
 
 if __name__ == "__main__":
     data = scrape_ollama_library()
-    with open("available_models.json", "w") as f:
-        json.dump(data, f, indent=4)
-
+    with open("available_models.json", "w", encoding="utf-8") as output:
+        json.dump(data, output, indent=4, ensure_ascii=False)
